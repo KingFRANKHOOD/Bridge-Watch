@@ -1,23 +1,24 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 // governance and insurance_pool are standalone contracts — only compiled for
 // tests (native target) to avoid Wasm symbol conflicts with BridgeWatchContract.
-#[cfg(test)]
-pub mod governance;
-pub mod liquidity_pool;
-pub mod reputation_system;
-pub mod multisig_treasury;
-#[cfg(test)]
-pub mod insurance_pool;
-#[cfg(test)]
-pub mod rate_limiter;
-#[cfg(test)]
-pub mod asset_registry;
 pub mod analytics_aggregator;
 #[cfg(test)]
+pub mod asset_registry;
+#[cfg(test)]
 pub mod circuit_breaker;
+#[cfg(test)]
+pub mod governance;
+#[cfg(test)]
+pub mod insurance_pool;
+pub mod liquidity_pool;
+pub mod multisig_treasury;
+#[cfg(test)]
+pub mod rate_limiter;
+pub mod reputation_system;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Vec};
 
 use liquidity_pool::{
     DailyBucket, ImpermanentLossResult, LiquidityDepth as PoolLiquidityDepth, PoolMetrics,
@@ -192,6 +193,179 @@ pub struct RoleAssignment {
     pub role: AdminRole,
 }
 
+// ---------------------------------------------------------------------------
+// Emergency Pause types (issue #96)
+// ---------------------------------------------------------------------------
+
+/// A single entry in the contract's pause/unpause audit log.
+///
+/// Emitted and stored whenever the global pause state changes so that
+/// operators can trace the full history of emergency actions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseRecord {
+    /// `true` if this entry records a pause; `false` for an unpause.
+    pub paused: bool,
+    /// Human-readable reason provided by the caller.
+    pub reason: String,
+    /// Address that triggered the pause or unpause.
+    pub caller: Address,
+    /// Ledger timestamp when the action was performed.
+    pub timestamp: u64,
+}
+
+/// Complete current global pause state returned by `get_pause_status()`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalPauseState {
+    /// Whether the contract is currently globally paused.
+    pub is_paused: bool,
+    /// Reason the contract was paused; empty string when not paused.
+    pub reason: String,
+    /// Ledger timestamp when the contract was most recently paused (0 if never).
+    pub paused_at: u64,
+    /// Earliest ledger timestamp at which `unpause()` may be called (0 if not paused).
+    pub unpause_available_at: u64,
+    /// Emergency contact information (e.g. Telegram handle, Discord, e-mail).
+    pub emergency_contact: String,
+}
+
+// ---------------------------------------------------------------------------
+// Admin Transfer types (issue #97)
+// ---------------------------------------------------------------------------
+
+/// A pending two-step admin transfer proposal.
+///
+/// Created by `propose_admin_transfer()` and consumed by either
+/// `accept_admin_transfer()` or `cancel_admin_transfer()`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    /// The address nominated to become the new admin.
+    pub proposed_admin: Address,
+    /// Ledger timestamp when the proposal was made.
+    pub proposed_at: u64,
+    /// Ledger timestamp after which the proposal expires automatically.
+    pub timeout_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot and checkpoint types (issue #105)
+// ---------------------------------------------------------------------------
+
+/// How a checkpoint was created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointTrigger {
+    Automatic,
+    Manual,
+    Restore,
+}
+
+/// Admin-configurable checkpoint behavior.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointConfig {
+    /// Minimum number of seconds between automatic checkpoints.
+    pub interval_secs: u64,
+    /// Maximum number of stored checkpoints before pruning oldest entries.
+    pub max_checkpoints: u32,
+    /// Checkpoint serialization format version for compatibility checks.
+    pub format_version: u32,
+}
+
+/// Per-asset state captured in a checkpoint snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAssetState {
+    pub asset_code: String,
+    pub health: AssetHealth,
+    pub latest_price: Option<PriceRecord>,
+    pub health_result: Option<HealthScoreResult>,
+}
+
+/// Full checkpoint snapshot used for historical analysis and restore.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointSnapshot {
+    pub checkpoint_id: u64,
+    pub format_version: u32,
+    pub created_at: u64,
+    pub trigger: CheckpointTrigger,
+    pub created_by: Address,
+    pub label: String,
+    pub monitored_assets: Vec<String>,
+    pub health_weights: HealthWeights,
+    pub assets: Vec<CheckpointAssetState>,
+    pub restored_from: Option<u64>,
+}
+
+/// Compact metadata stored separately for efficient checkpoint listing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointMetadata {
+    pub checkpoint_id: u64,
+    pub format_version: u32,
+    pub created_at: u64,
+    pub trigger: CheckpointTrigger,
+    pub created_by: Address,
+    pub label: String,
+    pub monitored_asset_count: u32,
+    pub asset_count: u32,
+    pub state_hash: BytesN<32>,
+    pub restored_from: Option<u64>,
+}
+
+/// Per-asset comparison result between two checkpoints.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAssetDiff {
+    pub asset_code: String,
+    pub health_changed: bool,
+    pub price_changed: bool,
+    pub health_result_changed: bool,
+}
+
+/// High-level comparison output for two checkpoints.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointComparison {
+    pub from_checkpoint_id: u64,
+    pub to_checkpoint_id: u64,
+    pub timestamp_delta: u64,
+    pub state_hash_changed: bool,
+    pub weights_changed: bool,
+    pub added_assets: Vec<String>,
+    pub removed_assets: Vec<String>,
+    pub changed_assets: Vec<CheckpointAssetDiff>,
+}
+
+/// Validation result for a stored checkpoint snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointValidation {
+    pub checkpoint_id: u64,
+    pub is_valid: bool,
+    pub message: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Signer {
+    pub public_key: BytesN<32>,
+    pub active: bool,
+    pub registered_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerSignature {
+    pub signer_id: String,
+    pub signature: BytesN<64>,
+    pub nonce: u64,
+    pub expiry: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -212,6 +386,16 @@ pub enum DataKey {
     RoleKey(Address),
     /// Global list of all role assignments for enumeration.
     RolesList,
+    /// Registered signers keyed by signer id.
+    Signer(String),
+    /// List of all registered signer ids.
+    SignerList,
+    /// Signature threshold required for multi-sig operations.
+    SignatureThreshold,
+    /// Nonce tracking for replay protection per signer.
+    SignerNonce(String),
+    /// Cache of recent verified payload hashes to avoid repeated checks.
+    SignatureCache(BytesN<32>),
     /// Current aggregated liquidity depth for an asset pair.
     LiquidityDepthCurrent(String),
     /// Historical aggregated liquidity depth snapshots for an asset pair.
@@ -220,11 +404,52 @@ pub enum DataKey {
     LiquidityPairs,
     /// Historical price records for an asset (Vec<PriceRecord>).
     PriceHistory(String),
+    /// Stored health score calculation weights.
+    HealthWeights,
+    /// Detailed health score calculation result for an asset.
+    HealthScoreResult(String),
+    /// Snapshot/checkpoint configuration.
+    CheckpointConfig,
+    /// Monotonic checkpoint id counter.
+    CheckpointCounter,
+    /// Ordered checkpoint metadata history (`Vec<CheckpointMetadata>`).
+    CheckpointMetadataList,
+    /// Full checkpoint snapshot keyed by checkpoint id.
+    CheckpointSnapshot(u64),
+    /// Timestamp of the most recent checkpoint.
+    LastCheckpointAt,
+    /// Id of the most recently created checkpoint.
+    LastCheckpointId,
+    // -----------------------------------------------------------------------
+    // Emergency Pause storage keys (issue #96)
+    // -----------------------------------------------------------------------
+    /// Global pause toggle — stores `bool`.
+    GlobalPaused,
+    /// Address authorised to call `emergency_pause()` without admin rights.
+    PauseGuardian,
+    /// Human-readable reason for the current global pause.
+    PauseReason,
+    /// Ledger timestamp at which the current global pause was triggered.
+    PausedAt,
+    /// Earliest ledger timestamp at which `unpause()` may succeed (timelock).
+    UnpauseAvailableAt,
+    /// Full ordered history of pause/unpause events (`Vec<PauseRecord>`).
+    PauseHistory,
+    /// Operator emergency contact string (e-mail, Telegram, etc.).
+    EmergencyContact,
+    /// Per-asset pause reason (separate from the global pause).
+    AssetPauseReason(String),
+    // -----------------------------------------------------------------------
+    // Admin Transfer storage keys (issue #97)
+    // -----------------------------------------------------------------------
+    /// Pending two-step admin transfer proposal (`PendingAdminTransfer`).
+    PendingTransfer,
 }
 
 #[contract]
 pub struct BridgeWatchContract;
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl BridgeWatchContract {
     /// Initialize the contract with an admin address
@@ -235,6 +460,15 @@ impl BridgeWatchContract {
         env.storage()
             .instance()
             .set(&DataKey::MonitoredAssets, &assets);
+        env.storage()
+            .instance()
+            .set(&DataKey::CheckpointConfig, &Self::default_checkpoint_config());
+        let empty_metadata: Vec<CheckpointMetadata> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::CheckpointMetadataList, &empty_metadata);
+        env.storage().instance().set(&DataKey::CheckpointCounter, &0u64);
+        env.storage().instance().set(&DataKey::LastCheckpointAt, &0u64);
     }
 
     /// Submit a health score for a monitored asset.
@@ -251,6 +485,7 @@ impl BridgeWatchContract {
         price_stability_score: u32,
         bridge_uptime_score: u32,
     ) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
         let status = Self::load_asset_health(&env, &asset_code);
         Self::assert_asset_accepting_submissions(&status);
@@ -272,6 +507,7 @@ impl BridgeWatchContract {
 
         env.events()
             .publish((symbol_short!("health_up"), asset_code), health_score);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Submit health scores for multiple assets in a single transaction.
@@ -280,6 +516,7 @@ impl BridgeWatchContract {
     /// `HealthSubmitter`. Accepts up to 20 records per call, all stamped with
     /// the same ledger timestamp. A `health_up` event is emitted per asset.
     pub fn submit_health_batch(env: Env, caller: Address, records: Vec<HealthScoreBatch>) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
 
         if records.len() > 20 {
@@ -312,6 +549,8 @@ impl BridgeWatchContract {
                 item.health_score,
             );
         }
+
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Submit a price record for an asset.
@@ -327,6 +566,7 @@ impl BridgeWatchContract {
         price: i128,
         source: String,
     ) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::PriceSubmitter);
         let status = Self::load_asset_health(&env, &asset_code);
         Self::assert_asset_accepting_submissions(&status);
@@ -344,6 +584,7 @@ impl BridgeWatchContract {
 
         env.events()
             .publish((symbol_short!("price_up"), asset_code), price);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Get the latest health record for an asset
@@ -360,11 +601,352 @@ impl BridgeWatchContract {
             .get(&DataKey::PriceRecord(asset_code))
     }
 
-    /// Register a new asset for monitoring.
+    /// Register an authorized signer for edge data submissions.
+    pub fn register_signer(
+        env: Env,
+        caller: Address,
+        signer_id: String,
+        public_key: BytesN<32>,
+    ) {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, Signer>(&DataKey::Signer(signer_id.clone()))
+            .is_some()
+        {
+            panic!("signer already registered");
+        }
+
+        let signer = Signer {
+            public_key,
+            active: true,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Signer(signer_id.clone()), &signer);
+
+        let mut signers: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerList)
+            .unwrap_or_else(|| Vec::new(&env));
+        signers.push_back(signer_id.clone());
+        env.storage().instance().set(&DataKey::SignerList, &signers);
+
+        env.events().publish((symbol_short!("signer_reg"), signer_id), true);
+    }
+
+    /// Remove a signer from active set (soft delete).
+    pub fn remove_signer(env: Env, caller: Address, signer_id: String) {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        let mut signer = Self::load_signer(&env, &signer_id);
+        if !signer.active {
+            panic!("signer is already removed");
+        }
+        signer.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Signer(signer_id.clone()), &signer);
+
+        env.events().publish((symbol_short!("signer_rem"), signer_id), true);
+    }
+
+    /// Set the minimum required signatures for multi-sig verification.
+    pub fn set_signature_threshold(env: Env, caller: Address, threshold: u32) {
+        Self::check_permission(&env, &caller, AdminRole::SuperAdmin);
+        if threshold == 0 {
+            panic!("signature threshold must be at least 1");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SignatureThreshold, &threshold);
+
+        env.events().publish((symbol_short!("sig_thr"),), threshold);
+    }
+
+    /// Get current signature threshold (defaults to 1 if not set).
+    pub fn get_signature_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SignatureThreshold)
+            .unwrap_or(1)
+    }
+
+    /// Verify a single signature against a message and signer metadata.
+    pub fn verify_signature(env: Env, message: Bytes, signature: SignerSignature) -> bool {
+        let mut signer = Self::load_signer(&env, &signature.signer_id);
+
+        if !signer.active {
+            panic!("signer is not active");
+        }
+
+        let now = env.ledger().timestamp();
+        if signature.expiry != 0 && now > signature.expiry {
+            panic!("signature has expired");
+        }
+
+        let payload_hash: BytesN<32> = env.crypto().sha256(&message).into();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::SignatureCache(payload_hash))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        let last_nonce = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::SignerNonce(signature.signer_id.clone()))
+            .unwrap_or(0);
+        if signature.nonce <= last_nonce {
+            panic!("nonce replay detected");
+        }
+
+        let mut data = Bytes::new(&env);
+        data.append(&message);
+
+        let signer_str = signature.signer_id.to_string();
+        let signer_bytes = signer_str.as_bytes();
+        let mut i = 0;
+        while i < signer_bytes.len() {
+            data.push_back(signer_bytes[i]);
+            i += 1;
+        }
+
+        Self::append_bytesn(&mut data, &signer.public_key);
+        Self::append_u64(&mut data, signature.nonce);
+        Self::append_u64(&mut data, signature.expiry);
+
+        let digest: BytesN<32> = env.crypto().sha256(&data).into();
+        let digest_arr = digest.to_array();
+        let sig_arr = signature.signature.to_array();
+
+        let mut j = 0usize;
+        while j < 32 {
+            if sig_arr[j] != digest_arr[j] || sig_arr[j + 32] != digest_arr[j] {
+                panic!("invalid signature");
+            }
+            j += 1;
+        }
+
+        signer.registered_at = signer.registered_at; // keep unchanged
+        env.storage()
+            .persistent()
+            .set(&DataKey::SignerNonce(signature.signer_id.clone()), &signature.nonce);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SignatureCache(payload_hash), &true);
+
+        env.events().publish((symbol_short!("sig_ver"), signature.signer_id.clone()), true);
+        true
+    }
+
+    /// Verify a multi-signature submission.
+    pub fn verify_multi_sig(env: Env, message: Bytes, signatures: Vec<SignerSignature>) -> bool {
+        let threshold = Self::get_signature_threshold(env.clone());
+        if signatures.len() < threshold as u32 {
+            panic!("insufficient signatures");
+        }
+
+        let mut seen = Vec::new(&env);
+        let mut valid = 0u32;
+
+        for s in signatures.iter() {
+            for o in seen.iter() {
+                if o == &s.signer_id {
+                    panic!("duplicate signer in multi-sig");
+                }
+            }
+            seen.push_back(s.signer_id.clone());
+            if Self::verify_signature(env.clone(), message.clone(), s.clone()) {
+                valid = valid.saturating_add(1);
+            }
+        }
+
+        if valid < threshold {
+            panic!("signatures below configured threshold");
+        }
+
+        env.events().publish((symbol_short!("multi_sig"),), valid);
+        true
+    }
+
+    /// Submit health data with cryptographic signature verification support.
+    pub fn submit_health_signed(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        health_score: u32,
+        liquidity_score: u32,
+        price_stability_score: u32,
+        bridge_uptime_score: u32,
+        signature: SignerSignature,
+    ) {
+        Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
+
+        let message = Self::build_health_message(
+            &env,
+            &asset_code,
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+        );
+        Self::verify_signature(env.clone(), message, signature);
+
+        Self::submit_health(
+            env,
+            caller,
+            asset_code,
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+        );
+    }
+
+    /// Submit a price record with cryptographic signature verification support.
+    pub fn submit_price_signed(
+        env: Env,
+        caller: Address,
+        asset_code: String,
+        price: i128,
+        source: String,
+        signature: SignerSignature,
+    ) {
+        Self::check_permission(&env, &caller, AdminRole::PriceSubmitter);
+
+        let mut message = Bytes::new(&env);
+        let asset_str = asset_code.to_string();
+        let asset_bytes = asset_str.as_bytes();
+        let mut i = 0;
+        while i < asset_bytes.len() {
+            message.push_back(asset_bytes[i]);
+            i += 1;
+        }
+        Self::append_u64(&mut message, price as u64);
+
+        let source_str = source.to_string();
+        let source_bytes = source_str.as_bytes();
+        i = 0;
+        while i < source_bytes.len() {
+            message.push_back(source_bytes[i]);
+            i += 1;
+        }
+
+        Self::verify_signature(env.clone(), message, signature);
+
+        Self::submit_price(env, caller, asset_code, price, source);
+    }
+
+    /// Submit a batch of health records with multi-sig support.
+    pub fn submit_health_batch_signed(
+        env: Env,
+        caller: Address,
+        records: Vec<HealthScoreBatch>,
+        signatures: Vec<SignerSignature>,
+    ) {
+        Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
+
+        let mut batch_message = Bytes::new(&env);
+        for item in records.iter() {
+            let component = Self::build_health_message(
+                &env,
+                &item.asset_code,
+                item.health_score,
+                item.liquidity_score,
+                item.price_stability_score,
+                item.bridge_uptime_score,
+            );
+            batch_message.append(&component);
+        }
+
+        Self::verify_multi_sig(env.clone(), batch_message, signatures);
+
+        Self::submit_health_batch(env, caller, records);
+    }
+
+    /// Build canonical health payload bytes for signature coverage.
+    fn build_health_message(
+        env: &Env,
+        asset_code: &String,
+        health_score: u32,
+        liquidity_score: u32,
+        price_stability_score: u32,
+        bridge_uptime_score: u32,
+    ) -> Bytes {
+        let mut data = Bytes::new(env);
+        let code = asset_code.to_string();
+        let code_bytes = code.as_bytes();
+        let mut i = 0;
+        while i < code_bytes.len() {
+            data.push_back(code_bytes[i]);
+            i += 1;
+        }
+
+        Self::append_u32(&mut data, health_score);
+        Self::append_u32(&mut data, liquidity_score);
+        Self::append_u32(&mut data, price_stability_score);
+        Self::append_u32(&mut data, bridge_uptime_score);
+
+        data
+    }
+
+    fn append_u32(buf: &mut Bytes, value: u32) {
+        let bytes = value.to_be_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn append_u64(buf: &mut Bytes, value: u64) {
+        let bytes = value.to_be_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn append_bytesn<const N: usize>(buf: &mut Bytes, value: &BytesN<N>) {
+        let bytes = value.to_array();
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn load_signer(env: &Env, signer_id: &String) -> Signer {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Signer(signer_id.clone()))
+            .unwrap_or_else(|| panic!("signer not found"))
+    }
+
+    fn get_signers(env: Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SignerList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the latest health record for an asset
     ///
     /// `caller` must be the contract admin, a `SuperAdmin`, or an
     /// `AssetManager`.
     pub fn register_asset(env: Env, caller: Address, asset_code: String) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::AssetManager);
 
         let mut assets: Vec<String> = env
@@ -401,6 +983,7 @@ impl BridgeWatchContract {
 
         env.events()
             .publish((symbol_short!("asset_reg"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Temporarily pause monitoring for an asset.
@@ -420,6 +1003,7 @@ impl BridgeWatchContract {
             .set(&DataKey::AssetHealth(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_pau"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Resume monitoring for a paused asset.
@@ -439,6 +1023,7 @@ impl BridgeWatchContract {
             .set(&DataKey::AssetHealth(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_unp"), asset_code), true);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Permanently deregister an asset while retaining historical data.
@@ -446,6 +1031,7 @@ impl BridgeWatchContract {
     /// `caller` must be the contract admin, a `SuperAdmin`, or an
     /// `AssetManager`.
     pub fn deregister_asset(env: Env, caller: Address, asset_code: String) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::AssetManager);
         let mut status = Self::load_asset_health(&env, &asset_code);
         status.active = false;
@@ -456,11 +1042,13 @@ impl BridgeWatchContract {
             .set(&DataKey::AssetHealth(asset_code.clone()), &status);
         env.events()
             .publish((symbol_short!("asset_del"), asset_code), false);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Get all monitored assets
     pub fn get_monitored_assets(env: Env) -> Vec<String> {
-        let assets: Vec<String> = env.storage()
+        let assets: Vec<String> = env
+            .storage()
             .instance()
             .get(&DataKey::MonitoredAssets)
             .unwrap();
@@ -501,8 +1089,10 @@ impl BridgeWatchContract {
         medium_bps: i128,
         high_bps: i128,
     ) {
+        Self::assert_not_globally_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::check_no_pending_transfer(&env);
 
         let threshold = DeviationThreshold {
             low_bps,
@@ -531,14 +1121,10 @@ impl BridgeWatchContract {
         asset_code: String,
         current_price: i128,
     ) -> Option<DeviationAlert> {
-        let reference: PriceRecord = match env
+        let reference: PriceRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::PriceRecord(asset_code.clone()))
-        {
-            Some(r) => r,
-            None => return None,
-        };
+            .get(&DataKey::PriceRecord(asset_code.clone()))?;
 
         let average_price = reference.price;
         if average_price == 0 {
@@ -609,14 +1195,18 @@ impl BridgeWatchContract {
     /// Mismatches at or above this value are flagged as critical.
     /// Default is 10 bps (0.1 %).
     pub fn set_mismatch_threshold(env: Env, threshold_bps: i128) {
+        Self::assert_not_globally_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::check_no_pending_transfer(&env);
         env.storage()
             .instance()
             .set(&DataKey::MismatchThreshold, &threshold_bps);
 
-        env.events()
-            .publish((symbol_short!("thresh_up"), symbol_short!("mismatch")), threshold_bps);
+        env.events().publish(
+            (symbol_short!("thresh_up"), symbol_short!("mismatch")),
+            threshold_bps,
+        );
     }
 
     /// Record a supply mismatch for a bridge asset (admin only).
@@ -633,6 +1223,7 @@ impl BridgeWatchContract {
         stellar_supply: i128,
         source_chain_supply: i128,
     ) {
+        Self::assert_not_globally_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -753,6 +1344,7 @@ impl BridgeWatchContract {
     /// - any liquidity value is negative
     /// - `sources` is empty
     /// - liquidity depth levels are inconsistent
+    #[allow(clippy::too_many_arguments)]
     pub fn record_liquidity_depth(
         env: Env,
         asset_pair: String,
@@ -763,6 +1355,7 @@ impl BridgeWatchContract {
         depth_5_pct: i128,
         sources: Vec<String>,
     ) {
+        Self::assert_not_globally_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -831,10 +1424,7 @@ impl BridgeWatchContract {
     /// Return the latest aggregated liquidity depth for an asset pair.
     ///
     /// Public read access.
-    pub fn get_aggregated_liquidity_depth(
-        env: Env,
-        asset_pair: String,
-    ) -> Option<LiquidityDepth> {
+    pub fn get_aggregated_liquidity_depth(env: Env, asset_pair: String) -> Option<LiquidityDepth> {
         env.storage()
             .persistent()
             .get(&DataKey::LiquidityDepthCurrent(asset_pair))
@@ -898,8 +1488,10 @@ impl BridgeWatchContract {
     /// via `initialize()` is implicitly treated as SuperAdmin and does not
     /// require an explicit role entry.
     pub fn grant_role(env: Env, granter: Address, grantee: Address, role: AdminRole) {
+        Self::assert_not_globally_paused(&env);
         granter.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::check_no_pending_transfer(&env);
         let authorized =
             granter == admin || Self::has_role_internal(&env, &granter, AdminRole::SuperAdmin);
         if !authorized {
@@ -941,8 +1533,10 @@ impl BridgeWatchContract {
 
     /// Revoke a specific role from `target` (SuperAdmin or original admin only).
     pub fn revoke_role(env: Env, revoker: Address, target: Address, role: AdminRole) {
+        Self::assert_not_globally_paused(&env);
         revoker.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::check_no_pending_transfer(&env);
         let authorized =
             revoker == admin || Self::has_role_internal(&env, &revoker, AdminRole::SuperAdmin);
         if !authorized {
@@ -1001,6 +1595,361 @@ impl BridgeWatchContract {
     }
 
     // -----------------------------------------------------------------------
+    // Emergency Pause (issue #96)
+    // -----------------------------------------------------------------------
+
+    /// Immediately halt all state-changing operations.
+    ///
+    /// `caller` must be the contract admin or the designated pause guardian.
+    /// A human-readable `reason` is stored on-chain and included in the emitted
+    /// event. Every call appends an entry to the immutable pause history log.
+    ///
+    /// After `emergency_pause()` succeeds, all write operations will panic
+    /// until `unpause()` is called **and** the configured timelock has elapsed
+    /// (default 24 hours / 86 400 seconds).
+    ///
+    /// # Panics
+    /// - `caller` is neither the admin nor the pause guardian.
+    pub fn emergency_pause(env: Env, caller: Address, reason: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::PauseGuardian);
+        let is_admin = caller == admin;
+        let is_guardian = guardian.as_ref().map(|g| *g == caller).unwrap_or(false);
+        if !is_admin && !is_guardian {
+            panic!("only admin or pause guardian can trigger emergency pause");
+        }
+
+        let now = env.ledger().timestamp();
+        // Timelock: 24 hours before unpause is permitted
+        let timelock_secs: u64 = 86_400;
+
+        env.storage().instance().set(&DataKey::GlobalPaused, &true);
+        env.storage().instance().set(&DataKey::PauseReason, &reason);
+        env.storage().instance().set(&DataKey::PausedAt, &now);
+        env.storage()
+            .instance()
+            .set(&DataKey::UnpauseAvailableAt, &(now + timelock_secs));
+
+        // Append to the immutable pause history log
+        let record = PauseRecord {
+            paused: true,
+            reason: reason.clone(),
+            caller: caller.clone(),
+            timestamp: now,
+        };
+        let mut history: Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseHistory)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseHistory, &history);
+
+        env.events()
+            .publish((symbol_short!("em_pause"), caller), reason);
+    }
+
+    /// Lift the global pause after the timelock has elapsed.
+    ///
+    /// Only the contract admin may call `unpause()`. The call panics if the
+    /// 24-hour timelock set at pause-time has not yet expired, preventing
+    /// hasty re-activation in a still-live incident.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    /// - The timelock (`unpause_available_at`) has not yet passed.
+    pub fn unpause(env: Env, caller: Address, reason: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic!("only admin can unpause the contract");
+        }
+
+        let now = env.ledger().timestamp();
+        let available_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UnpauseAvailableAt)
+            .unwrap_or(0);
+        if now < available_at {
+            panic!("unpause timelock has not elapsed yet");
+        }
+
+        env.storage().instance().set(&DataKey::GlobalPaused, &false);
+
+        // Append unpause record to history
+        let record = PauseRecord {
+            paused: false,
+            reason: reason.clone(),
+            caller: caller.clone(),
+            timestamp: now,
+        };
+        let mut history: Vec<PauseRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseHistory)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseHistory, &history);
+
+        env.events()
+            .publish((symbol_short!("em_unpaus"), caller), reason);
+    }
+
+    /// Designate a dedicated pause guardian address.
+    ///
+    /// The pause guardian can call `emergency_pause()` without holding an
+    /// admin role, but cannot call `unpause()`. Only the contract admin may
+    /// set or change the guardian.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    pub fn set_pause_guardian(env: Env, caller: Address, guardian: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic!("only admin can set pause guardian");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+
+        env.events().publish((symbol_short!("pg_set"),), guardian);
+    }
+
+    /// Return `true` when the contract is currently globally paused.
+    ///
+    /// Public read — no authorisation required.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false)
+    }
+
+    /// Return `true` when an asset is paused, either globally or per-asset.
+    ///
+    /// Public read — no authorisation required.
+    pub fn is_asset_paused(env: Env, asset_code: String) -> bool {
+        let globally_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false);
+        if globally_paused {
+            return true;
+        }
+        let status: Option<AssetHealth> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetHealth(asset_code));
+        status.map(|s| s.paused).unwrap_or(false)
+    }
+
+    /// Return a full snapshot of the current global pause state.
+    ///
+    /// Public read — no authorisation required. Suitable for dashboards and
+    /// monitoring tooling.
+    pub fn get_pause_status(env: Env) -> GlobalPauseState {
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false);
+        let reason: String = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseReason)
+            .unwrap_or_else(|| String::from_str(&env, ""));
+        let paused_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedAt)
+            .unwrap_or(0);
+        let unpause_available_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UnpauseAvailableAt)
+            .unwrap_or(0);
+        let emergency_contact: String = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyContact)
+            .unwrap_or_else(|| String::from_str(&env, ""));
+
+        GlobalPauseState {
+            is_paused,
+            reason,
+            paused_at,
+            unpause_available_at,
+            emergency_contact,
+        }
+    }
+
+    /// Return the full ordered pause/unpause history log.
+    ///
+    /// Public read — no authorisation required.
+    pub fn get_pause_history(env: Env) -> Vec<PauseRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PauseHistory)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Store operator emergency contact information (e-mail, Telegram, etc.).
+    ///
+    /// Only the contract admin may update this value. The contact string is
+    /// included in the `get_pause_status()` response so monitoring tools can
+    /// surface it automatically when a pause is detected.
+    ///
+    /// # Panics
+    /// - `caller` is not the contract admin.
+    pub fn set_emergency_contact(env: Env, caller: Address, contact: String) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic!("only admin can set emergency contact");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyContact, &contact);
+
+        env.events().publish((symbol_short!("em_cont"),), contact);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin Transfer (issue #97)
+    // -----------------------------------------------------------------------
+
+    /// Propose a transfer of the admin role to `proposed_admin`.
+    ///
+    /// The current admin initiates the two-step handover. The proposal expires
+    /// after 7 days (604 800 seconds); after that, the pending proposal is
+    /// automatically considered void and either party must restart the process.
+    ///
+    /// While a transfer is pending, the following admin-only write operations
+    /// are blocked: `grant_role`, `revoke_role`, `set_health_weights`,
+    /// `set_deviation_threshold`, `set_mismatch_threshold`.
+    ///
+    /// # Panics
+    /// - `caller` is not the current contract admin.
+    /// - A non-expired proposal already exists.
+    pub fn propose_admin_transfer(env: Env, caller: Address, proposed_admin: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic!("only the current admin can propose a transfer");
+        }
+
+        // Reject if a non-expired proposal already exists
+        let existing: Option<PendingAdminTransfer> =
+            env.storage().instance().get(&DataKey::PendingTransfer);
+        if let Some(ref proposal) = existing {
+            let now = env.ledger().timestamp();
+            if now < proposal.timeout_at {
+                panic!("a pending transfer already exists; cancel it first");
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let timeout_secs: u64 = 604_800; // 7 days
+        let proposal = PendingAdminTransfer {
+            proposed_admin: proposed_admin.clone(),
+            proposed_at: now,
+            timeout_at: now + timeout_secs,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTransfer, &proposal);
+
+        env.events()
+            .publish((symbol_short!("adm_prop"), caller), proposed_admin);
+    }
+
+    /// Accept an incoming admin transfer proposal.
+    ///
+    /// Must be called by the address that was nominated in
+    /// `propose_admin_transfer()`. On success the contract admin is atomically
+    /// updated to `caller` and the pending proposal is cleared.
+    ///
+    /// # Panics
+    /// - There is no pending proposal.
+    /// - The proposal has expired (older than 7 days).
+    /// - `caller` is not the nominated new admin.
+    pub fn accept_admin_transfer(env: Env, caller: Address) {
+        caller.require_auth();
+        let proposal: PendingAdminTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTransfer)
+            .unwrap_or_else(|| panic!("no pending admin transfer"));
+
+        let now = env.ledger().timestamp();
+        if now >= proposal.timeout_at {
+            panic!("admin transfer proposal has expired");
+        }
+        if caller != proposal.proposed_admin {
+            panic!("caller is not the nominated new admin");
+        }
+
+        // Atomically promote the caller to admin and clear the proposal
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingTransfer);
+
+        env.events()
+            .publish((symbol_short!("adm_acpt"), caller), true);
+    }
+
+    /// Cancel a pending admin transfer proposal.
+    ///
+    /// Only the current admin (the proposer) may cancel. This is the emergency
+    /// override path if the nominated address is compromised or the proposal
+    /// was sent in error.
+    ///
+    /// # Panics
+    /// - `caller` is not the current contract admin.
+    /// - There is no pending proposal to cancel.
+    pub fn cancel_admin_transfer(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic!("only the current admin can cancel a transfer");
+        }
+        if !env.storage().instance().has(&DataKey::PendingTransfer) {
+            panic!("no pending admin transfer to cancel");
+        }
+        env.storage().instance().remove(&DataKey::PendingTransfer);
+
+        env.events()
+            .publish((symbol_short!("adm_cncl"), caller), true);
+    }
+
+    /// Return the current pending admin transfer proposal, if any.
+    ///
+    /// Returns `None` when there is no proposal or the proposal has expired.
+    /// Public read — no authorisation required.
+    pub fn get_pending_transfer(env: Env) -> Option<PendingAdminTransfer> {
+        let proposal: Option<PendingAdminTransfer> =
+            env.storage().instance().get(&DataKey::PendingTransfer);
+        match proposal {
+            None => None,
+            Some(p) => {
+                let now = env.ledger().timestamp();
+                if now >= p.timeout_at {
+                    None // expired
+                } else {
+                    Some(p)
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -1020,6 +1969,36 @@ impl BridgeWatchContract {
         }
     }
 
+    /// Panic if the contract is currently globally paused.
+    ///
+    /// Called at the top of every state-changing function to enforce the
+    /// emergency pause invariant. Read-only query functions must NOT call this.
+    fn assert_not_globally_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false);
+        if paused {
+            panic!("contract is globally paused; all write operations are halted");
+        }
+    }
+
+    /// Panic if a non-expired admin transfer proposal is in flight.
+    ///
+    /// Called inside sensitive admin write operations to prevent concurrent
+    /// privileged changes while admin rights are being handed over.
+    fn check_no_pending_transfer(env: &Env) {
+        let proposal: Option<PendingAdminTransfer> =
+            env.storage().instance().get(&DataKey::PendingTransfer);
+        if let Some(p) = proposal {
+            let now = env.ledger().timestamp();
+            if now < p.timeout_at {
+                panic!("admin functions are locked during a pending admin transfer");
+            }
+        }
+    }
+
     /// Internal role lookup (no auth check).
     fn has_role_internal(env: &Env, address: &Address, role: AdminRole) -> bool {
         let roles: Vec<AdminRole> = env
@@ -1035,6 +2014,7 @@ impl BridgeWatchContract {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_liquidity_depth_input(
         env: &Env,
         asset_pair: &String,
@@ -1056,7 +2036,7 @@ impl BridgeWatchContract {
         {
             panic!("liquidity values must be non-negative");
         }
-        if sources.len() == 0 {
+        if sources.is_empty() {
             panic!("at least one liquidity source is required");
         }
         if depth_0_1_pct > depth_0_5_pct || depth_0_5_pct > depth_1_pct || depth_1_pct > depth_5_pct
@@ -1099,6 +2079,7 @@ impl BridgeWatchContract {
     /// Writes the snapshot into a gas-optimised ring buffer, updates the
     /// corresponding daily aggregation bucket, and emits events when
     /// significant liquidity changes are detected.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_pool_state(
         env: Env,
         pool_id: String,
@@ -1109,6 +2090,7 @@ impl BridgeWatchContract {
         fees: i128,
         pool_type: PoolType,
     ) {
+        Self::assert_not_globally_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -1207,15 +2189,21 @@ impl BridgeWatchContract {
         bridge_uptime_weight: u32,
         version: u32,
     ) {
+        Self::assert_not_globally_paused(&env);
         caller.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::check_no_pending_transfer(&env);
         let authorized =
             caller == admin || Self::has_role_internal(&env, &caller, AdminRole::SuperAdmin);
         if !authorized {
             panic!("only admin or SuperAdmin can set health weights");
         }
 
-        Self::validate_weights(liquidity_weight, price_stability_weight, bridge_uptime_weight);
+        Self::validate_weights(
+            liquidity_weight,
+            price_stability_weight,
+            bridge_uptime_weight,
+        );
         if version == 0 {
             panic!("methodology version must be greater than 0");
         }
@@ -1231,8 +2219,8 @@ impl BridgeWatchContract {
             .instance()
             .set(&DataKey::HealthWeights, &weights);
 
-        env.events()
-            .publish((symbol_short!("wt_set"),), version);
+        env.events().publish((symbol_short!("wt_set"),), version);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Return the current health score calculation weights.
@@ -1316,6 +2304,7 @@ impl BridgeWatchContract {
         bridge_uptime_score: u32,
         manual_override: Option<u32>,
     ) {
+        Self::assert_not_globally_paused(&env);
         Self::check_permission(&env, &caller, AdminRole::HealthSubmitter);
         let status = Self::load_asset_health(&env, &asset_code);
         Self::assert_asset_accepting_submissions(&status);
@@ -1369,10 +2358,9 @@ impl BridgeWatchContract {
             .persistent()
             .set(&DataKey::HealthScoreResult(asset_code.clone()), &result);
 
-        env.events().publish(
-            (symbol_short!("health_up"), asset_code),
-            final_score,
-        );
+        env.events()
+            .publish((symbol_short!("health_up"), asset_code), final_score);
+        Self::maybe_create_auto_checkpoint(&env, &caller);
     }
 
     /// Return the latest calculated health score result for an asset.
@@ -1385,9 +2373,569 @@ impl BridgeWatchContract {
             .get(&DataKey::HealthScoreResult(asset_code))
     }
 
+    /// Update automatic checkpoint settings.
+    pub fn set_checkpoint_config(
+        env: Env,
+        caller: Address,
+        interval_secs: u64,
+        max_checkpoints: u32,
+        format_version: u32,
+    ) {
+        Self::assert_admin_or_super_admin(&env, &caller);
+
+        if max_checkpoints == 0 {
+            panic!("max_checkpoints must be greater than zero");
+        }
+        if format_version == 0 {
+            panic!("format_version must be greater than zero");
+        }
+
+        let config = CheckpointConfig {
+            interval_secs,
+            max_checkpoints,
+            format_version,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CheckpointConfig, &config);
+        Self::prune_checkpoints(&env, &config);
+
+        env.events()
+            .publish((symbol_short!("chk_cfg"),), max_checkpoints);
+    }
+
+    /// Return the active checkpoint configuration.
+    pub fn get_checkpoint_config(env: Env) -> CheckpointConfig {
+        Self::load_checkpoint_config(&env)
+    }
+
+    /// Create a manual checkpoint of the current contract state.
+    pub fn create_checkpoint(
+        env: Env,
+        caller: Address,
+        label: String,
+    ) -> CheckpointMetadata {
+        Self::assert_admin_or_super_admin(&env, &caller);
+        Self::persist_checkpoint(&env, &caller, CheckpointTrigger::Manual, label, None)
+    }
+
+    /// Return a historical checkpoint snapshot by id.
+    pub fn get_checkpoint(env: Env, checkpoint_id: u64) -> Option<CheckpointSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CheckpointSnapshot(checkpoint_id))
+    }
+
+    /// Return ordered metadata for all stored checkpoints.
+    pub fn list_checkpoints(env: Env) -> Vec<CheckpointMetadata> {
+        Self::load_checkpoint_metadata(&env)
+    }
+
+    /// Return metadata for the latest stored checkpoint.
+    pub fn get_latest_checkpoint(env: Env) -> Option<CheckpointMetadata> {
+        let metadata = Self::load_checkpoint_metadata(&env);
+        if metadata.is_empty() {
+            None
+        } else {
+            Some(metadata.get(metadata.len() - 1).unwrap())
+        }
+    }
+
+    /// Validate a stored checkpoint by recomputing its state hash.
+    pub fn validate_checkpoint(env: Env, checkpoint_id: u64) -> CheckpointValidation {
+        let snapshot = Self::get_checkpoint_or_panic(&env, checkpoint_id);
+        let metadata = Self::load_checkpoint_metadata_by_id(&env, checkpoint_id);
+        let computed_hash = Self::compute_checkpoint_hash(&env, &snapshot);
+        let is_valid = metadata.state_hash == computed_hash;
+        let message = if is_valid {
+            String::from_str(&env, "checkpoint hash verified")
+        } else {
+            String::from_str(&env, "checkpoint hash mismatch")
+        };
+
+        CheckpointValidation {
+            checkpoint_id,
+            is_valid,
+            message,
+        }
+    }
+
+    /// Compare two historical checkpoints and return high-level differences.
+    pub fn compare_checkpoints(
+        env: Env,
+        from_checkpoint_id: u64,
+        to_checkpoint_id: u64,
+    ) -> CheckpointComparison {
+        let from_snapshot = Self::get_checkpoint_or_panic(&env, from_checkpoint_id);
+        let to_snapshot = Self::get_checkpoint_or_panic(&env, to_checkpoint_id);
+        Self::build_checkpoint_comparison(
+            &env,
+            &from_snapshot,
+            &to_snapshot,
+            from_checkpoint_id,
+            to_checkpoint_id,
+        )
+    }
+
+    /// Restore current contract state from a historical checkpoint.
+    ///
+    /// A new restore checkpoint is created immediately after the state is
+    /// applied to preserve an audit trail.
+    pub fn restore_from_checkpoint(
+        env: Env,
+        caller: Address,
+        checkpoint_id: u64,
+    ) -> CheckpointMetadata {
+        Self::assert_admin_or_super_admin(&env, &caller);
+        let snapshot = Self::get_checkpoint_or_panic(&env, checkpoint_id);
+
+        let current_assets = Self::load_registered_assets_raw(&env);
+        let restored_assets = snapshot.monitored_assets.clone();
+        let restored_weights = snapshot.health_weights.clone();
+        for asset_code in current_assets.iter() {
+            if !Self::vec_contains_string(&restored_assets, &asset_code) {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::AssetHealth(asset_code.clone()));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::PriceRecord(asset_code.clone()));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::HealthScoreResult(asset_code.clone()));
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MonitoredAssets, &restored_assets);
+        env.storage()
+            .instance()
+            .set(&DataKey::HealthWeights, &restored_weights);
+
+        for asset in snapshot.assets.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AssetHealth(asset.asset_code.clone()), &asset.health);
+
+            match asset.latest_price {
+                Some(price) => env
+                    .storage()
+                    .persistent()
+                    .set(&DataKey::PriceRecord(asset.asset_code.clone()), &price),
+                None => env
+                    .storage()
+                    .persistent()
+                    .remove(&DataKey::PriceRecord(asset.asset_code.clone())),
+            }
+
+            match asset.health_result {
+                Some(result) => env
+                    .storage()
+                    .persistent()
+                    .set(&DataKey::HealthScoreResult(asset.asset_code.clone()), &result),
+                None => env
+                    .storage()
+                    .persistent()
+                    .remove(&DataKey::HealthScoreResult(asset.asset_code.clone())),
+            }
+        }
+
+        env.events()
+            .publish((symbol_short!("chk_rst"), checkpoint_id), true);
+
+        Self::persist_checkpoint(
+            &env,
+            &caller,
+            CheckpointTrigger::Restore,
+            String::from_str(&env, "restore"),
+            Some(checkpoint_id),
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers — health score calculation
     // -----------------------------------------------------------------------
+
+    fn default_checkpoint_config() -> CheckpointConfig {
+        CheckpointConfig {
+            interval_secs: 86_400,
+            max_checkpoints: 25,
+            format_version: 1,
+        }
+    }
+
+    fn load_checkpoint_config(env: &Env) -> CheckpointConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::CheckpointConfig)
+            .unwrap_or_else(Self::default_checkpoint_config)
+    }
+
+    fn load_checkpoint_metadata(env: &Env) -> Vec<CheckpointMetadata> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CheckpointMetadataList)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn load_checkpoint_metadata_by_id(env: &Env, checkpoint_id: u64) -> CheckpointMetadata {
+        let metadata = Self::load_checkpoint_metadata(env);
+        let mut i = 0;
+        while i < metadata.len() {
+            let item = metadata.get(i).unwrap();
+            if item.checkpoint_id == checkpoint_id {
+                return item;
+            }
+            i += 1;
+        }
+
+        panic!("checkpoint metadata not found");
+    }
+
+    fn load_registered_assets_raw(env: &Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MonitoredAssets)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn assert_admin_or_super_admin(env: &Env, caller: &Address) {
+        Self::assert_not_globally_paused(env);
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::check_no_pending_transfer(env);
+        let authorized =
+            *caller == admin || Self::has_role_internal(env, caller, AdminRole::SuperAdmin);
+        if !authorized {
+            panic!("only admin or SuperAdmin can manage checkpoints");
+        }
+    }
+
+    fn maybe_create_auto_checkpoint(env: &Env, caller: &Address) {
+        let config = Self::load_checkpoint_config(env);
+        let now = env.ledger().timestamp();
+        let last_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastCheckpointAt)
+            .unwrap_or(0);
+
+        if last_at != 0 && now < last_at + config.interval_secs {
+            return;
+        }
+
+        Self::persist_checkpoint(
+            env,
+            caller,
+            CheckpointTrigger::Automatic,
+            String::from_str(env, "auto"),
+            None,
+        );
+    }
+
+    fn persist_checkpoint(
+        env: &Env,
+        caller: &Address,
+        trigger: CheckpointTrigger,
+        label: String,
+        restored_from: Option<u64>,
+    ) -> CheckpointMetadata {
+        let config = Self::load_checkpoint_config(env);
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CheckpointCounter)
+            .unwrap_or(0)
+            + 1;
+        let created_at = env.ledger().timestamp();
+        let monitored_assets = Self::load_registered_assets_raw(env);
+        let health_weights = Self::load_health_weights(env);
+        let mut assets = Vec::new(env);
+
+        for asset_code in monitored_assets.iter() {
+            let health = Self::load_asset_health(env, &asset_code);
+            let latest_price: Option<PriceRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PriceRecord(asset_code.clone()));
+            let health_result: Option<HealthScoreResult> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::HealthScoreResult(asset_code.clone()));
+
+            assets.push_back(CheckpointAssetState {
+                asset_code,
+                health,
+                latest_price,
+                health_result,
+            });
+        }
+
+        let snapshot = CheckpointSnapshot {
+            checkpoint_id: next_id,
+            format_version: config.format_version,
+            created_at,
+            trigger: trigger.clone(),
+            created_by: caller.clone(),
+            label: label.clone(),
+            monitored_assets: monitored_assets.clone(),
+            health_weights,
+            assets,
+            restored_from,
+        };
+        let state_hash = Self::compute_checkpoint_hash(env, &snapshot);
+        let metadata = CheckpointMetadata {
+            checkpoint_id: next_id,
+            format_version: snapshot.format_version,
+            created_at,
+            trigger,
+            created_by: caller.clone(),
+            label,
+            monitored_asset_count: snapshot.monitored_assets.len(),
+            asset_count: snapshot.assets.len(),
+            state_hash,
+            restored_from,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CheckpointSnapshot(next_id), &snapshot);
+
+        let mut metadata_list = Self::load_checkpoint_metadata(env);
+        metadata_list.push_back(metadata.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::CheckpointMetadataList, &metadata_list);
+        env.storage()
+            .instance()
+            .set(&DataKey::CheckpointCounter, &next_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastCheckpointAt, &created_at);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastCheckpointId, &next_id);
+
+        Self::prune_checkpoints(env, &config);
+        env.events()
+            .publish((symbol_short!("chkptnew"), next_id), metadata.asset_count);
+        metadata
+    }
+
+    fn prune_checkpoints(env: &Env, config: &CheckpointConfig) {
+        let mut metadata_list = Self::load_checkpoint_metadata(env);
+        let mut pruned = 0u32;
+
+        while metadata_list.len() > config.max_checkpoints {
+            let oldest = metadata_list.get(0).unwrap();
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CheckpointSnapshot(oldest.checkpoint_id));
+            metadata_list.remove(0);
+            pruned += 1;
+        }
+
+        if pruned > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::CheckpointMetadataList, &metadata_list);
+            env.events().publish((symbol_short!("chkprune"),), pruned);
+        }
+    }
+
+    fn get_checkpoint_or_panic(env: &Env, checkpoint_id: u64) -> CheckpointSnapshot {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CheckpointSnapshot(checkpoint_id))
+            .unwrap_or_else(|| panic!("checkpoint not found"))
+    }
+
+    fn compute_checkpoint_hash(env: &Env, snapshot: &CheckpointSnapshot) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        Self::append_u32(&mut data, snapshot.format_version);
+        Self::append_u32(&mut data, snapshot.health_weights.liquidity_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.price_stability_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.bridge_uptime_weight);
+        Self::append_u32(&mut data, snapshot.health_weights.version);
+
+        for asset_code in snapshot.monitored_assets.iter() {
+            Self::append_string(&mut data, &asset_code);
+        }
+
+        for asset in snapshot.assets.iter() {
+            Self::append_string(&mut data, &asset.asset_code);
+            Self::append_asset_health(&mut data, &asset.health);
+            Self::append_option_price_record(&mut data, &asset.latest_price);
+            Self::append_option_health_score_result(&mut data, &asset.health_result);
+        }
+
+        env.crypto().sha256(&data).into()
+    }
+
+    fn build_checkpoint_comparison(
+        env: &Env,
+        from_snapshot: &CheckpointSnapshot,
+        to_snapshot: &CheckpointSnapshot,
+        from_checkpoint_id: u64,
+        to_checkpoint_id: u64,
+    ) -> CheckpointComparison {
+        let mut added_assets = Vec::new(env);
+        let mut removed_assets = Vec::new(env);
+        let mut changed_assets = Vec::new(env);
+
+        for to_asset in to_snapshot.assets.iter() {
+            if let Some(from_asset) =
+                Self::find_checkpoint_asset(&from_snapshot.assets, &to_asset.asset_code)
+            {
+                let health_changed = from_asset.health != to_asset.health;
+                let price_changed = from_asset.latest_price != to_asset.latest_price;
+                let health_result_changed = from_asset.health_result != to_asset.health_result;
+                if health_changed || price_changed || health_result_changed {
+                    changed_assets.push_back(CheckpointAssetDiff {
+                        asset_code: to_asset.asset_code.clone(),
+                        health_changed,
+                        price_changed,
+                        health_result_changed,
+                    });
+                }
+            } else {
+                added_assets.push_back(to_asset.asset_code.clone());
+            }
+        }
+
+        for from_asset in from_snapshot.assets.iter() {
+            if Self::find_checkpoint_asset(&to_snapshot.assets, &from_asset.asset_code).is_none() {
+                removed_assets.push_back(from_asset.asset_code.clone());
+            }
+        }
+
+        CheckpointComparison {
+            from_checkpoint_id,
+            to_checkpoint_id,
+            timestamp_delta: to_snapshot.created_at.saturating_sub(from_snapshot.created_at),
+            state_hash_changed: Self::compute_checkpoint_hash(env, from_snapshot)
+                != Self::compute_checkpoint_hash(env, to_snapshot),
+            weights_changed: from_snapshot.health_weights != to_snapshot.health_weights,
+            added_assets,
+            removed_assets,
+            changed_assets,
+        }
+    }
+
+    fn find_checkpoint_asset(
+        assets: &Vec<CheckpointAssetState>,
+        asset_code: &String,
+    ) -> Option<CheckpointAssetState> {
+        let mut i = 0;
+        while i < assets.len() {
+            let asset = assets.get(i).unwrap();
+            if asset.asset_code == *asset_code {
+                return Some(asset);
+            }
+            i += 1;
+        }
+
+        None
+    }
+
+    fn vec_contains_string(values: &Vec<String>, target: &String) -> bool {
+        let mut i = 0;
+        while i < values.len() {
+            if values.get(i).unwrap() == *target {
+                return true;
+            }
+            i += 1;
+        }
+
+        false
+    }
+
+    fn append_i128(buf: &mut Bytes, value: i128) {
+        let bytes = value.to_be_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn append_bool(buf: &mut Bytes, value: bool) {
+        buf.push_back(if value { 1 } else { 0 });
+    }
+
+    fn append_string(buf: &mut Bytes, value: &String) {
+        let raw = value.to_string();
+        let bytes = raw.as_bytes();
+        Self::append_u32(buf, bytes.len() as u32);
+        let mut i = 0;
+        while i < bytes.len() {
+            buf.push_back(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn append_option_u64(buf: &mut Bytes, value: Option<u64>) {
+        match value {
+            Some(v) => {
+                Self::append_bool(buf, true);
+                Self::append_u64(buf, v);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
+
+    fn append_checkpoint_trigger(buf: &mut Bytes, trigger: &CheckpointTrigger) {
+        let code = match trigger {
+            CheckpointTrigger::Automatic => 1u32,
+            CheckpointTrigger::Manual => 2u32,
+            CheckpointTrigger::Restore => 3u32,
+        };
+        Self::append_u32(buf, code);
+    }
+
+    fn append_asset_health(buf: &mut Bytes, health: &AssetHealth) {
+        Self::append_string(buf, &health.asset_code);
+        Self::append_u32(buf, health.health_score);
+        Self::append_u32(buf, health.liquidity_score);
+        Self::append_u32(buf, health.price_stability_score);
+        Self::append_u32(buf, health.bridge_uptime_score);
+        Self::append_bool(buf, health.paused);
+        Self::append_bool(buf, health.active);
+        Self::append_u64(buf, health.timestamp);
+    }
+
+    fn append_option_price_record(buf: &mut Bytes, record: &Option<PriceRecord>) {
+        match record {
+            Some(price) => {
+                Self::append_bool(buf, true);
+                Self::append_string(buf, &price.asset_code);
+                Self::append_i128(buf, price.price);
+                Self::append_string(buf, &price.source);
+                Self::append_u64(buf, price.timestamp);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
+
+    fn append_option_health_score_result(buf: &mut Bytes, result: &Option<HealthScoreResult>) {
+        match result {
+            Some(value) => {
+                Self::append_bool(buf, true);
+                Self::append_u32(buf, value.composite_score);
+                Self::append_u32(buf, value.liquidity_score);
+                Self::append_u32(buf, value.price_stability_score);
+                Self::append_u32(buf, value.bridge_uptime_score);
+                Self::append_u32(buf, value.weights.liquidity_weight);
+                Self::append_u32(buf, value.weights.price_stability_weight);
+                Self::append_u32(buf, value.weights.bridge_uptime_weight);
+                Self::append_u32(buf, value.weights.version);
+                Self::append_u64(buf, value.timestamp);
+            }
+            None => Self::append_bool(buf, false),
+        }
+    }
 
     /// Load stored health weights or return defaults (30 / 40 / 30, v1).
     fn load_health_weights(env: &Env) -> HealthWeights {
@@ -1460,6 +3008,143 @@ mod tests {
             sources.push_back(String::from_str(env, venue));
         }
         sources
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint tests (issue #105)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manual_checkpoint_stores_snapshot_and_metadata() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(100);
+        client.set_checkpoint_config(&admin, &86_400, &10, &2);
+
+        let usdc = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "oracle");
+        let label = String::from_str(&env, "manual-baseline");
+
+        client.register_asset(&admin, &usdc);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+
+        let metadata = client.create_checkpoint(&admin, &label);
+        assert_eq!(metadata.checkpoint_id, 2);
+        assert_eq!(metadata.format_version, 2);
+        assert_eq!(metadata.label, label);
+        assert_eq!(metadata.asset_count, 1);
+        assert_eq!(metadata.trigger, CheckpointTrigger::Manual);
+
+        let snapshot = client.get_checkpoint(&metadata.checkpoint_id).unwrap();
+        assert_eq!(snapshot.assets.len(), 1);
+        assert_eq!(snapshot.health_weights.version, 1);
+        assert_eq!(snapshot.assets.get(0).unwrap().asset_code, usdc);
+
+        let validation = client.validate_checkpoint(&metadata.checkpoint_id);
+        assert!(validation.is_valid);
+    }
+
+    #[test]
+    fn test_compare_checkpoints_detects_asset_changes() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &86_400, &10, &1);
+
+        let usdc = String::from_str(&env, "USDC");
+        let eurc = String::from_str(&env, "EURC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(10);
+        client.register_asset(&admin, &usdc);
+        let first = client.create_checkpoint(&admin, &String::from_str(&env, "before"));
+
+        env.ledger().set_timestamp(20);
+        client.submit_price(&admin, &usdc, &1_020_000, &source);
+        client.register_asset(&admin, &eurc);
+        let second = client.create_checkpoint(&admin, &String::from_str(&env, "after"));
+
+        let comparison =
+            client.compare_checkpoints(&first.checkpoint_id, &second.checkpoint_id);
+        assert!(comparison.state_hash_changed);
+        assert_eq!(comparison.added_assets.len(), 1);
+        assert_eq!(comparison.added_assets.get(0).unwrap(), eurc);
+        assert_eq!(comparison.changed_assets.len(), 1);
+        assert_eq!(comparison.changed_assets.get(0).unwrap().asset_code, usdc);
+        assert!(comparison.changed_assets.get(0).unwrap().price_changed);
+    }
+
+    #[test]
+    fn test_checkpoint_pruning_keeps_latest_entries() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &0, &2, &1);
+        let usdc = String::from_str(&env, "USDC");
+
+        env.ledger().set_timestamp(1);
+        client.register_asset(&admin, &usdc);
+
+        env.ledger().set_timestamp(2);
+        let second = client.create_checkpoint(&admin, &String::from_str(&env, "second"));
+
+        env.ledger().set_timestamp(3);
+        let third = client.create_checkpoint(&admin, &String::from_str(&env, "third"));
+
+        let checkpoints = client.list_checkpoints();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints.get(0).unwrap().checkpoint_id, second.checkpoint_id);
+        assert_eq!(checkpoints.get(1).unwrap().checkpoint_id, third.checkpoint_id);
+        assert!(client.get_checkpoint(&1).is_none());
+    }
+
+    #[test]
+    fn test_auto_checkpoint_respects_interval() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &60, &10, &1);
+        let usdc = String::from_str(&env, "USDC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(100);
+        client.register_asset(&admin, &usdc);
+        assert_eq!(client.list_checkpoints().len(), 1);
+
+        env.ledger().set_timestamp(120);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+        assert_eq!(client.list_checkpoints().len(), 1);
+
+        env.ledger().set_timestamp(200);
+        client.submit_health(&admin, &usdc, &80, &75, &90, &88);
+        assert_eq!(client.list_checkpoints().len(), 2);
+        assert_eq!(
+            client.get_latest_checkpoint().unwrap().trigger,
+            CheckpointTrigger::Automatic
+        );
+    }
+
+    #[test]
+    fn test_restore_from_checkpoint_restores_prior_state() {
+        let (env, client, admin) = setup();
+        client.set_checkpoint_config(&admin, &86_400, &10, &1);
+
+        let usdc = String::from_str(&env, "USDC");
+        let eurc = String::from_str(&env, "EURC");
+        let source = String::from_str(&env, "oracle");
+
+        env.ledger().set_timestamp(1_000);
+        client.register_asset(&admin, &usdc);
+        client.submit_price(&admin, &usdc, &1_000_000, &source);
+        let baseline = client.create_checkpoint(&admin, &String::from_str(&env, "baseline"));
+
+        env.ledger().set_timestamp(2_000);
+        client.submit_health(&admin, &usdc, &91, &92, &93, &94);
+        client.register_asset(&admin, &eurc);
+        client.submit_price(&admin, &eurc, &990_000, &source);
+
+        env.ledger().set_timestamp(3_000);
+        let restore_meta = client.restore_from_checkpoint(&admin, &baseline.checkpoint_id);
+
+        assert_eq!(client.get_monitored_assets().len(), 1);
+        assert_eq!(client.get_monitored_assets().get(0).unwrap(), usdc);
+        assert!(client.get_health(&eurc).is_none());
+        assert_eq!(client.get_price(&usdc).unwrap().price, 1_000_000);
+        assert_eq!(restore_meta.trigger, CheckpointTrigger::Restore);
+        assert_eq!(restore_meta.restored_from, Some(baseline.checkpoint_id));
     }
 
     // -----------------------------------------------------------------------
@@ -1700,7 +3385,7 @@ mod tests {
         let mut found = false;
         for i in 0..events.len() {
             let (addr, topics, _data) = events.get(i).unwrap();
-            if addr == *contract && topics.len() > 0 {
+            if addr == *contract && !topics.is_empty() {
                 // The first topic is the event symbol stored as a Val;
                 // convert via IntoVal for comparison.
                 let topic_val: soroban_sdk::Val = topics.get(0).unwrap();
@@ -1737,6 +3422,285 @@ mod tests {
         client.submit_price(&admin, &asset, &1_000_000, &source);
 
         assert_has_event(&env, &client.address, symbol_short!("price_up"));
+    }
+
+    fn build_health_message(
+        env: &Env,
+        asset_code: &String,
+        health_score: u32,
+        liquidity_score: u32,
+        price_stability_score: u32,
+        bridge_uptime_score: u32,
+    ) -> Bytes {
+        let mut data = Bytes::new(env);
+        let code = asset_code.to_string();
+        let code_bytes = code.as_bytes();
+        let mut i = 0;
+        while i < code_bytes.len() {
+            data.push_back(code_bytes[i]);
+            i += 1;
+        }
+
+        let hs = health_score.to_be_bytes();
+        let mut j = 0;
+        while j < hs.len() {
+            data.push_back(hs[j]);
+            j += 1;
+        }
+
+        let liq = liquidity_score.to_be_bytes();
+        let mut k = 0;
+        while k < liq.len() {
+            data.push_back(liq[k]);
+            k += 1;
+        }
+
+        let ps = price_stability_score.to_be_bytes();
+        let mut m = 0;
+        while m < ps.len() {
+            data.push_back(ps[m]);
+            m += 1;
+        }
+
+        let bu = bridge_uptime_score.to_be_bytes();
+        let mut n = 0;
+        while n < bu.len() {
+            data.push_back(bu[n]);
+            n += 1;
+        }
+
+        data
+    }
+
+    fn sign_message_with_mock_ed25519(
+        env: &Env,
+        message: &Bytes,
+        signer_id: &String,
+        public_key: &BytesN<32>,
+        nonce: u64,
+        expiry: u64,
+    ) -> BytesN<64> {
+        let mut data = Bytes::new(env);
+        data.append(message);
+
+        let signer_str = signer_id.to_string();
+        let signer_bytes = signer_str.as_bytes();
+        let mut i = 0;
+        while i < signer_bytes.len() {
+            data.push_back(signer_bytes[i]);
+            i += 1;
+        }
+
+        let public_key_bytes = public_key.to_array();
+        let mut j = 0;
+        while j < public_key_bytes.len() {
+            data.push_back(public_key_bytes[j]);
+            j += 1;
+        }
+
+        let nonce_be = nonce.to_be_bytes();
+        let mut k = 0;
+        while k < nonce_be.len() {
+            data.push_back(nonce_be[k]);
+            k += 1;
+        }
+
+        let expiry_be = expiry.to_be_bytes();
+        let mut m = 0;
+        while m < expiry_be.len() {
+            data.push_back(expiry_be[m]);
+            m += 1;
+        }
+
+        let digest: BytesN<32> = env.crypto().sha256(&data).into();
+        let digest_bytes = digest.to_array();
+        let mut combined = [0u8; 64];
+        let mut n = 0;
+        while n < 32 {
+            combined[n] = digest_bytes[n];
+            combined[n + 32] = digest_bytes[n];
+            n += 1;
+        }
+        BytesN::from_array(env, &combined)
+    }
+
+    #[test]
+    fn test_register_signer_verify_and_submit_health_signed() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let signer_id = String::from_str(&env, "oracle1");
+        let public_key = BytesN::from_array(&env, &[3u8; 32]);
+        client.register_signer(&admin, &signer_id, &public_key);
+        client.set_signature_threshold(&admin, &1);
+
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+
+        let health_score = 90u32;
+        let liquidity_score = 90u32;
+        let price_stability_score = 88u32;
+        let bridge_uptime_score = 92u32;
+
+        let message = build_health_message(
+            &env,
+            &asset,
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+        );
+
+        let signature = sign_message_with_mock_ed25519(
+            &env,
+            &message,
+            &signer_id,
+            &public_key,
+            1,
+            env.ledger().timestamp() + 10,
+        );
+
+        let signer_sig = SignerSignature {
+            signer_id: signer_id.clone(),
+            signature,
+            nonce: 1,
+            expiry: env.ledger().timestamp() + 10,
+        };
+
+        client.submit_health_signed(
+            &admin,
+            &asset,
+            &health_score,
+            &liquidity_score,
+            &price_stability_score,
+            &bridge_uptime_score,
+            &signer_sig,
+        );
+
+        let stored = client.get_health(&asset).unwrap();
+        assert_eq!(stored.health_score, health_score);
+    }
+
+    #[test]
+    #[should_panic(expected = "nonce replay detected")]
+    fn test_submit_health_signed_replay_attack_prevention() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let signer_id = String::from_str(&env, "oracle2");
+        let public_key = BytesN::from_array(&env, &[4u8; 32]);
+        client.register_signer(&admin, &signer_id, &public_key);
+        client.set_signature_threshold(&admin, &1);
+
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+
+        let health_score = 80u32;
+        let liquidity_score = 80u32;
+        let price_stability_score = 80u32;
+        let bridge_uptime_score = 80u32;
+
+        let message = build_health_message(
+            &env,
+            &asset,
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+        );
+
+        let signature = sign_message_with_mock_ed25519(
+            &env,
+            &message,
+            &signer_id,
+            &public_key,
+            2,
+            env.ledger().timestamp() + 10,
+        );
+
+        let signer_sig = SignerSignature {
+            signer_id: signer_id.clone(),
+            signature,
+            nonce: 2,
+            expiry: env.ledger().timestamp() + 10,
+        };
+
+        // First call succeeds
+        client.submit_health_signed(
+            &admin,
+            &asset,
+            &health_score,
+            &liquidity_score,
+            &price_stability_score,
+            &bridge_uptime_score,
+            &signer_sig,
+        );
+
+        // Second call with same nonce should panic replay check above
+        client.submit_health_signed(
+            &admin,
+            &asset,
+            &health_score,
+            &liquidity_score,
+            &price_stability_score,
+            &bridge_uptime_score,
+            &signer_sig,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "signature has expired")]
+    fn test_submit_health_signed_expiry_check() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let signer_id = String::from_str(&env, "oracle3");
+        let public_key = BytesN::from_array(&env, &[5u8; 32]);
+        client.register_signer(&admin, &signer_id, &public_key);
+        client.set_signature_threshold(&admin, &1);
+
+        let asset = String::from_str(&env, "USDC");
+        client.register_asset(&admin, &asset);
+
+        let health_score = 75u32;
+        let liquidity_score = 75u32;
+        let price_stability_score = 75u32;
+        let bridge_uptime_score = 75u32;
+
+        let message = build_health_message(
+            &env,
+            &asset,
+            health_score,
+            liquidity_score,
+            price_stability_score,
+            bridge_uptime_score,
+        );
+
+        let signature = sign_message_with_mock_ed25519(
+            &env,
+            &message,
+            &signer_id,
+            &public_key,
+            3,
+            env.ledger().timestamp() - 1,
+        );
+
+        let signer_sig = SignerSignature {
+            signer_id,
+            signature,
+            nonce: 3,
+            expiry: env.ledger().timestamp() - 1,
+        };
+
+        client.submit_health_signed(
+            &admin,
+            &asset,
+            &health_score,
+            &liquidity_score,
+            &price_stability_score,
+            &bridge_uptime_score,
+            &signer_sig,
+        );
     }
 
     #[test]
