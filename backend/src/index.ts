@@ -6,13 +6,8 @@ import swaggerUi from "@fastify/swagger-ui";
 import { config } from "./config/index.js";
 import { logger } from "./utils/logger.js";
 import { registerRoutes } from "./api/routes/index.js";
-import { registerTracing } from "./api/middleware/tracing.js";
 import { registerValidation } from "./api/middleware/validation.js";
-<<<<<<< HEAD
-=======
 import { registerMetrics } from "./api/middleware/metrics.js";
-import { startBridgeVerificationJob } from "./jobs/verification.job.js";
->>>>>>> upstream/main
 import {
   registerRateLimiting,
   getRateLimitMetrics,
@@ -20,10 +15,13 @@ import {
 import { initJobSystem } from "./workers/index.js";
 import { JobQueue } from "./workers/queue.js";
 import { swaggerOptions, swaggerUiOptions } from "./config/openapi.js";
+import { registerCorrelationMiddleware } from "./api/middleware/correlation.middleware.js";
+import { registerRequestLoggingMiddleware } from "./api/middleware/logging.middleware.js";
+import { metricsRoutes } from "./api/routes/metrics.js";
 
 export async function buildServer() {
   const server = Fastify({
-    loggerInstance: logger,
+    logger: logger,
     ajv: {
       customOptions: {
         strict: false,
@@ -57,8 +55,11 @@ export async function buildServer() {
     additionalProperties: true,
   });
 
-  // Register tracing middleware first (to capture all requests)
-  await registerTracing(server as any);
+  // Register correlation middleware first (to capture trace context for all requests)
+  await registerCorrelationMiddleware(server as any);
+
+  // Register request/response logging middleware
+  await registerRequestLoggingMiddleware(server as any);
 
   // Register metrics middleware (to capture all requests)
   await registerMetrics(server as any);
@@ -89,6 +90,8 @@ export async function buildServer() {
   // Register routes
   await registerRoutes(server as any);
 
+  // Register Prometheus metrics endpoint
+  await metricsRoutes(server as any);
   // Rate-limit metrics (internal monitoring endpoint)
   server.get(
     "/api/v1/metrics/rate-limits",
