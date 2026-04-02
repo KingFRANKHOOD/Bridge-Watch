@@ -13,7 +13,6 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { version = "22.0.10" }
-soroban-sdk-macros = "22.0.10"
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.10", features = ["testutils"] }
